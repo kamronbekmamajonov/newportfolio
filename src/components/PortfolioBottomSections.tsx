@@ -15,7 +15,23 @@ import {
   X,
 } from 'lucide-react';
 import { BOTTOM_SECTIONS_DATA, PROFILE_DATA } from '../utils/portfolio.ts';
-import { submitContactToGoogleSheets } from '../services/googleSheets.ts';
+import {
+  appendContactRowToSheet,
+  createPortfolioContactsSheet,
+  fetchSpreadsheetMetadata,
+  getAccessToken,
+  getActiveSpreadsheetMeta,
+  googleSignIn,
+  initAuth,
+  isGoogleSheetsEndpointConfigured,
+  listDriveSpreadsheets,
+  logout,
+  setActiveSpreadsheetMeta,
+  submitContactToGoogleSheets,
+  validateContactFormInput,
+  type ActiveSpreadsheetMeta,
+  type DriveSpreadsheetItem,
+} from '../services/googleSheets.ts';
 
 interface LightboxState {
   isOpen: boolean;
@@ -71,11 +87,99 @@ export const PortfolioBottomSections: React.FC = () => {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const isSubmittingRef = React.useRef(false);
 
+  // Google Workspace OAuth & Sheet state
+  const [needsAuth, setNeedsAuth] = useState(true);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [driveSheets, setDriveSheets] = useState<DriveSpreadsheetItem[]>([]);
+  const [activeSheet, setActiveSheet] = useState<ActiveSpreadsheetMeta | null>(
+    getActiveSpreadsheetMeta()
+  );
+  const [confirmAppendOpen, setConfirmAppendOpen] = useState(false);
+
+  const loadUserSpreadsheets = async (token: string) => {
+    try {
+      const files = await listDriveSpreadsheets(token);
+      setDriveSheets(files);
+      if (!getActiveSpreadsheetMeta() && files.length > 0) {
+        const preferred =
+          files.find(
+            (f) =>
+              f.name.toLowerCase().includes('murojaatlar') ||
+              f.name.toLowerCase().includes('portfolio')
+          ) || files[0];
+        const meta = await fetchSpreadsheetMetadata(token, preferred.id);
+        setActiveSpreadsheetMeta(meta);
+        setActiveSheet(meta);
+      }
+    } catch (err) {
+      console.error('Drive spreadsheets load error:', err);
+    }
+  };
+
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (_user, token) => {
+        setNeedsAuth(false);
+        void loadUserSpreadsheets(token);
+      },
+      () => {
+        setNeedsAuth(true);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  const handleGoogleLogin = async () => {
+    setIsLoggingIn(true);
+    setSubmitError(null);
+    try {
+      const res = await googleSignIn();
+      if (res) {
+        setNeedsAuth(false);
+        await loadUserSpreadsheets(res.accessToken);
+      }
+    } catch {
+      setSubmitError('Google orqali ulanishda xatolik yuz berdi.');
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleSelectSheet = async (spreadsheetId: string) => {
+    if (!spreadsheetId) return;
+    const token = await getAccessToken();
+    if (!token) {
+      setNeedsAuth(true);
+      return;
+    }
+    try {
+      const meta = await fetchSpreadsheetMetadata(token, spreadsheetId);
+      setActiveSpreadsheetMeta(meta);
+      setActiveSheet(meta);
+    } catch {
+      setSubmitError('Tanlangan Google Sheet ma’lumotlarini yuklab bo‘lmadi.');
+    }
+  };
+
   const handleContactSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (isSubmittingRef.current || isSubmitting) return;
 
     setSubmitError(null);
+    const validation = validateContactFormInput({ name, contact, message });
+    if (!validation.valid) {
+      setSubmitError(validation.message);
+      return;
+    }
+
+    // 1. If Google OAuth token is active, open explicit confirmation dialog before mutating Google Sheet
+    const token = await getAccessToken();
+    if (token) {
+      setConfirmAppendOpen(true);
+      return;
+    }
+
+    // 2. Otherwise fall back to configured Apps Script Web App endpoint (or report if not configured)
     isSubmittingRef.current = true;
     setIsSubmitting(true);
 
@@ -93,6 +197,48 @@ export const PortfolioBottomSections: React.FC = () => {
       }
 
       setSubmitted(true);
+    } finally {
+      isSubmittingRef.current = false;
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleConfirmAppendToSheet = async () => {
+    if (isSubmittingRef.current || isSubmitting) return;
+    const token = await getAccessToken();
+    if (!token) {
+      setConfirmAppendOpen(false);
+      setNeedsAuth(true);
+      return;
+    }
+
+    isSubmittingRef.current = true;
+    setIsSubmitting(true);
+    setSubmitError(null);
+
+    try {
+      let targetMeta = activeSheet;
+      if (!targetMeta) {
+        targetMeta = await createPortfolioContactsSheet(token);
+        setActiveSpreadsheetMeta(targetMeta);
+        setActiveSheet(targetMeta);
+        await loadUserSpreadsheets(token);
+      }
+
+      await appendContactRowToSheet(token, targetMeta, {
+        name,
+        contact,
+        message,
+        source: 'contact-section',
+      });
+
+      setConfirmAppendOpen(false);
+      setSubmitted(true);
+    } catch {
+      setConfirmAppendOpen(false);
+      setSubmitError(
+        'Kontakt ma’lumotlarini Google Sheets jadvaliga yozishda xatolik yuz berdi.'
+      );
     } finally {
       isSubmittingRef.current = false;
       setIsSubmitting(false);
@@ -782,6 +928,91 @@ export const PortfolioBottomSections: React.FC = () => {
                         <Send className="w-4 h-4" />
                       </button>
                     </div>
+
+                    {/* Google Sheets Direct Connection Bar */}
+                    {!isGoogleSheetsEndpointConfigured() && (
+                      <div className="pt-3 border-t border-[#E2E8F0] flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+                        {needsAuth ? (
+                          <>
+                            <span className="text-[#64748B]">
+                              Google Sheets jadvaliga to‘g‘ridan-to‘g‘ri yozish:
+                            </span>
+                            <button
+                              type="button"
+                              onClick={handleGoogleLogin}
+                              disabled={isLoggingIn}
+                              className="gsi-material-button inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl bg-white hover:bg-slate-50 border border-[#E2E8F0] text-xs font-bold text-[#111827] transition-all cursor-pointer shrink-0 disabled:opacity-60"
+                            >
+                              <div className="gsi-material-button-state" />
+                              <div className="gsi-material-button-content-wrapper flex items-center gap-2">
+                                <div className="gsi-material-button-icon w-4 h-4 shrink-0">
+                                  <svg
+                                    version="1.1"
+                                    xmlns="http://www.w3.org/2000/svg"
+                                    viewBox="0 0 48 48"
+                                    style={{ display: 'block', width: '100%', height: '100%' }}
+                                  >
+                                    <path
+                                      fill="#EA4335"
+                                      d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                                    />
+                                    <path
+                                      fill="#4285F4"
+                                      d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                                    />
+                                    <path
+                                      fill="#FBBC05"
+                                      d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                                    />
+                                    <path
+                                      fill="#34A853"
+                                      d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                                    />
+                                    <path fill="none" d="M0 0h48v48H0z" />
+                                  </svg>
+                                </div>
+                                <span className="gsi-material-button-contents">
+                                  {isLoggingIn ? 'Ulanmoqda...' : 'Sign in with Google'}
+                                </span>
+                                <span style={{ display: 'none' }}>Sign in with Google</span>
+                              </div>
+                            </button>
+                          </>
+                        ) : (
+                          <div className="w-full flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                              <span className="text-[#111827] font-bold shrink-0">
+                                Google Sheet:
+                              </span>
+                              <select
+                                aria-label="Google Sheets jadvalini tanlash"
+                                value={activeSheet?.spreadsheetId || ''}
+                                onChange={(e) => void handleSelectSheet(e.target.value)}
+                                className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] text-xs font-semibold text-[#111827]"
+                              >
+                                <option value="">
+                                  {driveSheets.length === 0
+                                    ? 'Avtomatik yangi jadval yaratiladi'
+                                    : 'Jadvalni tanlang...'}
+                                </option>
+                                {driveSheets.map((s) => (
+                                  <option key={s.id} value={s.id}>
+                                    {s.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void logout()}
+                              className="text-xs font-semibold text-[#64748B] hover:text-red-600 cursor-pointer shrink-0 self-end sm:self-auto"
+                            >
+                              Chiqish
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </form>
                 )}
               </div>
@@ -799,6 +1030,68 @@ export const PortfolioBottomSections: React.FC = () => {
           </footer>
         </div>
       </section>
+
+      {/* EXPLICIT USER CONFIRMATION MODAL FOR GOOGLE SHEETS MUTATION */}
+      {confirmAppendOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-sheets-modal-title"
+        >
+          <div className="max-w-md w-full bg-white rounded-3xl p-6 border border-[#E2E8F0] shadow-2xl">
+            <h3
+              id="confirm-sheets-modal-title"
+              className="font-display font-bold text-lg text-[#111827]"
+            >
+              Google Sheets jadvaliga yozishni tasdiqlaysizmi?
+            </h3>
+            <p className="mt-2 text-xs sm:text-sm text-[#64748B] leading-relaxed">
+              Quyidagi kontakt ma’lumotlari{' '}
+              <strong className="text-[#111827]">
+                {activeSheet
+                  ? `"${activeSheet.title}" (${activeSheet.firstSheetTitle})`
+                  : '"Kamronbek Portfolio — Murojaatlar" (yangi jadval)'}
+              </strong>{' '}
+              ichiga qo‘shiladi:
+            </p>
+            <div className="mt-3 p-3.5 rounded-2xl bg-[#F5F8FF] border border-[#E2E8F0] text-xs space-y-1">
+              <div>
+                <span className="text-[#64748B]">Ism / Kompaniya: </span>
+                <strong className="text-[#111827]">{name}</strong>
+              </div>
+              <div>
+                <span className="text-[#64748B]">Aloqa: </span>
+                <strong className="text-[#111827]">{contact}</strong>
+              </div>
+              {message.trim() && (
+                <div>
+                  <span className="text-[#64748B]">Xabar: </span>
+                  <span className="text-[#111827]">{message}</span>
+                </div>
+              )}
+            </div>
+            <div className="mt-5 flex items-center justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setConfirmAppendOpen(false)}
+                disabled={isSubmitting}
+                className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-xs sm:text-sm font-bold text-slate-700 transition-colors cursor-pointer"
+              >
+                Bekor qilish
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmAppendToSheet()}
+                disabled={isSubmitting}
+                className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-xs sm:text-sm font-bold text-white transition-colors cursor-pointer disabled:opacity-60"
+              >
+                {isSubmitting ? 'Saqlanmoqda...' : 'Tasdiqlash va yozish'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* LIGHTBOX MODAL FOR BEFORE / AFTER */}
       {lightbox.isOpen && (
